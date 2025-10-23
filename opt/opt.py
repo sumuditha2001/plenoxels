@@ -19,8 +19,10 @@ import math
 import argparse
 import cv2
 from util.dataset import datasets
-from util.util import Timing, get_expon_lr_func, generate_dirs_equirect, viridis_cmap
+from util.util import Timing, get_expon_lr_func, generate_dirs_equirect, viridis_cmap,get_cosine_lr_func,get_cyclic_lr_func
 from util import config_util
+import time
+import lpips
 
 from warnings import warn
 from datetime import datetime
@@ -30,6 +32,9 @@ from tqdm import tqdm
 from typing import NamedTuple, Optional, Union
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# LPIPS model on GPU
+lpips_alex = lpips.LPIPS(net='alex').to(device)  # 'alex' or 'vgg'
 
 parser = argparse.ArgumentParser()
 config_util.define_common_args(parser)
@@ -244,6 +249,63 @@ group.add_argument('--n_train', type=int, default=None, help='Number of training
 group.add_argument('--nosphereinit', action='store_true', default=False,
                      help='do not start with sphere bounds (please do not use for 360)')
 
+# --- gaussian initialisation -------------------------------------------------
+group.add_argument('--use_gaussian_init', action='store_true', default=False,
+                   help='Initialize SH coefficients and density with Gaussian distribution')
+group.add_argument('--gaussian_mean', type=float, default=0.0, help='Mean for Gaussian initialization')
+group.add_argument('--gaussian_std', type=float, default=0.01, help='Standard deviation for Gaussian initialization')
+group.add_argument('--gaussian_sigma', type=float, default=0.1, help='Initial sigma for density if using Gaussian')
+group.add_argument('--gaussian_sigma_bg', type=float, default=0.1, help='Initial sigma for background density if using Gaussian')
+
+# --- cyclic learning rate options -------------------------------------------------
+group = parser.add_argument_group("cyclic_lr")
+group.add_argument('--use_cyclic_lr', action='store_true', default=False,
+                   help='If set, use cyclic learning rate schedule instead of exponential/cosine')
+group.add_argument('--cyclic_base_lr', type=float, default=1e-4,
+                   help='Lower bound of the cyclic learning rate')
+group.add_argument('--cyclic_max_lr', type=float, default=1e-2,
+                   help='Upper bound of the cyclic learning rate')
+group.add_argument('--cyclic_step_size', type=int, default=2000,
+                   help='Number of iterations per half cycle (so full cycle = 2 * step_size)')
+group.add_argument('--cyclic_mode', choices=["triangular", "triangular2", "exp_range"], default="triangular",
+                   help='Cyclic mode: triangular, triangular2, or exp_range')
+group.add_argument('--cyclic_gamma', type=float, default=1.0,
+                   help='Scaling factor for exp_range mode')
+
+# ------- cosine annealing options -------------------------------------------------
+group = parser.add_argument_group("cosine_annealing")
+group.add_argument('--use_cosine_annealing', action='store_true', default=False,
+help='If set, use cosine annealing schedule (instead of exponential) for ALL LRs')
+group.add_argument('--cosine_T_max', type=int, default=250000,
+help='Number of steps for the cosine cycle (T_max). If 0, cosine will behave like constant after warmup')
+group.add_argument('--cosine_eta_min', type=float, default=0.0,
+help='Minimum learning rate reached by cosine annealing')
+group.add_argument('--cosine_warmup_steps', type=int, default=0,
+help='Linear warmup steps from 0 to initial lr before cosine annealing starts')
+
+# Progressive TV and sparsity scheduling
+group = parser.add_argument_group("progressive_tv")
+group.add_argument('--use_progressive_tv', action='store_true', default=False,
+                   help='Enable exponential progressive TV and sparsity decay')
+
+group.add_argument('--progressive_tv_start', type=float, default=1e-3,
+                   help='Initial lambda_tv value for progressive decay')
+group.add_argument('--progressive_tv_end', type=float, default=1e-5,
+                   help='Final lambda_tv value for progressive decay')
+
+group.add_argument('--progressive_tv_sh_start', type=float, default=1e-3,
+                   help='Initial lambda_tv_sh value for progressive decay')
+group.add_argument('--progressive_tv_sh_end', type=float, default=1e-6,
+                   help='Final lambda_tv_sh value for progressive decay')
+
+group.add_argument('--progressive_sparsity_start', type=float, default=0.01,
+                   help='Initial sparsity fraction for TV regularization')
+group.add_argument('--progressive_sparsity_end', type=float, default=0.001,
+                   help='Final sparsity fraction for TV regularization')
+
+
+
+
 args = parser.parse_args()
 config_util.maybe_merge_config_file(args)
 
@@ -296,13 +358,25 @@ grid = svox2.SparseGrid(reso=reso_list[reso_id],
                         background_nlayers=args.background_nlayers,
                         background_reso=args.background_reso)
 
-# DC -> gray; mind the SH scaling!
-grid.sh_data.data[:] = 0.0
-grid.density_data.data[:] = 0.0 if args.lr_fg_begin_step > 0 else args.init_sigma
 
-if grid.use_background:
-    grid.background_data.data[..., -1] = args.init_sigma_bg
-    #  grid.background_data.data[..., :-1] = 0.5 / svox2.utils.SH_C0
+if args.use_gaussian_init:
+    # Gaussian initialization for SH coefficients
+    grid.sh_data.data.normal_(mean=args.gaussian_mean, std=args.gaussian_std)
+    
+    # Gaussian initialization for density
+    grid.density_data.data.normal_(mean=args.gaussian_mean, std=args.gaussian_sigma)
+    
+    # Background initialization
+    if grid.use_background:
+        grid.background_data.data[..., -1].normal_(mean=args.gaussian_mean, std=args.gaussian_sigma_bg)
+else:
+    # DC -> gray; mind the SH scaling!
+    grid.sh_data.data[:] = 0.0
+    grid.density_data.data[:] = 0.0 if args.lr_fg_begin_step > 0 else args.init_sigma
+
+    if grid.use_background:
+        grid.background_data.data[..., -1] = args.init_sigma_bg
+        #  grid.background_data.data[..., :-1] = 0.5 / svox2.utils.SH_C0
 
 #  grid.sh_data.data[:, 0] = 4.0
 #  osh = grid.density_data.data.shape
@@ -346,16 +420,71 @@ resample_cameras = [
     ]
 ckpt_path = path.join(args.train_dir, 'ckpt.npz')
 
-lr_sigma_func = get_expon_lr_func(args.lr_sigma, args.lr_sigma_final, args.lr_sigma_delay_steps,
-                                  args.lr_sigma_delay_mult, args.lr_sigma_decay_steps)
-lr_sh_func = get_expon_lr_func(args.lr_sh, args.lr_sh_final, args.lr_sh_delay_steps,
-                               args.lr_sh_delay_mult, args.lr_sh_decay_steps)
-lr_basis_func = get_expon_lr_func(args.lr_basis, args.lr_basis_final, args.lr_basis_delay_steps,
-                               args.lr_basis_delay_mult, args.lr_basis_decay_steps)
-lr_sigma_bg_func = get_expon_lr_func(args.lr_sigma_bg, args.lr_sigma_bg_final, args.lr_sigma_bg_delay_steps,
-                               args.lr_sigma_bg_delay_mult, args.lr_sigma_bg_decay_steps)
-lr_color_bg_func = get_expon_lr_func(args.lr_color_bg, args.lr_color_bg_final, args.lr_color_bg_delay_steps,
-                               args.lr_color_bg_delay_mult, args.lr_color_bg_decay_steps)
+if args.use_cosine_annealing:
+# Use cosine for all lrs. warmup and eta_min can be controlled via the new args.
+    lr_sigma_func = get_cosine_lr_func(args.lr_sigma, args.lr_sigma_final,
+    T_max=args.cosine_T_max,
+    warmup_steps=args.cosine_warmup_steps,
+    eta_min=args.cosine_eta_min)
+
+
+    lr_sh_func = get_cosine_lr_func(args.lr_sh, args.lr_sh_final,
+    T_max=args.cosine_T_max,
+    warmup_steps=args.cosine_warmup_steps,
+    eta_min=args.cosine_eta_min)
+
+
+    lr_basis_func = get_cosine_lr_func(args.lr_basis, args.lr_basis_final,
+    T_max=args.cosine_T_max,
+    warmup_steps=args.cosine_warmup_steps,
+    eta_min=args.cosine_eta_min)
+
+
+    lr_sigma_bg_func = get_cosine_lr_func(args.lr_sigma_bg, args.lr_sigma_bg_final,
+    T_max=args.cosine_T_max,
+    warmup_steps=args.cosine_warmup_steps,
+    eta_min=args.cosine_eta_min)
+
+
+    lr_color_bg_func = get_cosine_lr_func(args.lr_color_bg, args.lr_color_bg_final,
+    T_max=args.cosine_T_max,
+    warmup_steps=args.cosine_warmup_steps,
+    eta_min=args.cosine_eta_min)
+
+elif args.use_cyclic_lr:
+    # Use cyclic learning rate for all params
+    lr_sigma_func = get_cyclic_lr_func(
+        args.cyclic_base_lr, args.cyclic_max_lr, args.cyclic_step_size,
+        mode=args.cyclic_mode, gamma=args.cyclic_gamma)
+
+    lr_sh_func = get_cyclic_lr_func(
+        args.cyclic_base_lr, args.cyclic_max_lr, args.cyclic_step_size,
+        mode=args.cyclic_mode, gamma=args.cyclic_gamma)
+
+    lr_basis_func = get_cyclic_lr_func(
+        args.cyclic_base_lr, args.cyclic_max_lr, args.cyclic_step_size,
+        mode=args.cyclic_mode, gamma=args.cyclic_gamma)
+
+    lr_sigma_bg_func = get_cyclic_lr_func(
+        args.cyclic_base_lr, args.cyclic_max_lr, args.cyclic_step_size,
+        mode=args.cyclic_mode, gamma=args.cyclic_gamma)
+
+    lr_color_bg_func = get_cyclic_lr_func(
+        args.cyclic_base_lr, args.cyclic_max_lr, args.cyclic_step_size,
+        mode=args.cyclic_mode, gamma=args.cyclic_gamma)
+
+else:
+    lr_sigma_func = get_expon_lr_func(args.lr_sigma, args.lr_sigma_final, args.lr_sigma_delay_steps,
+                                    args.lr_sigma_delay_mult, args.lr_sigma_decay_steps)
+    lr_sh_func = get_expon_lr_func(args.lr_sh, args.lr_sh_final, args.lr_sh_delay_steps,
+                                args.lr_sh_delay_mult, args.lr_sh_decay_steps)
+    lr_basis_func = get_expon_lr_func(args.lr_basis, args.lr_basis_final, args.lr_basis_delay_steps,
+                                args.lr_basis_delay_mult, args.lr_basis_decay_steps)
+    lr_sigma_bg_func = get_expon_lr_func(args.lr_sigma_bg, args.lr_sigma_bg_final, args.lr_sigma_bg_delay_steps,
+                                args.lr_sigma_bg_delay_mult, args.lr_sigma_bg_decay_steps)
+    lr_color_bg_func = get_expon_lr_func(args.lr_color_bg, args.lr_color_bg_final, args.lr_color_bg_delay_steps,
+                                args.lr_color_bg_delay_mult, args.lr_color_bg_decay_steps)
+    
 lr_sigma_factor = 1.0
 lr_sh_factor = 1.0
 lr_basis_factor = 1.0
@@ -366,6 +495,9 @@ if args.enable_random:
     warn("Randomness is enabled for training (normal for LLFF & scenes with background)")
 
 epoch_id = -1
+eval_mse_list, eval_psnr_list = [], []
+start_time = time.time()
+
 while True:
     dset.shuffle_rays()
     epoch_id += 1
@@ -405,6 +537,20 @@ while True:
                                    ndc_coeffs=dset_test.ndc_coeffs)
                 rgb_pred_test = grid.volume_render_image(cam, use_kernel=True)
                 rgb_gt_test = dset_test.gt[img_id].to(device=device)
+
+                # --- Compute LPIPS ---
+                # Convert range [0,1] → [-1,1]
+                rgb_pred_lpips = 2.0 * rgb_pred_test.clamp(0, 1) - 1.0
+                rgb_gt_lpips   = 2.0 * rgb_gt_test.clamp(0, 1) - 1.0
+
+                # HWC → NCHW for LPIPS input
+                rgb_pred_lpips = rgb_pred_lpips.permute(2, 0, 1).unsqueeze(0)
+                rgb_gt_lpips   = rgb_gt_lpips.permute(2, 0, 1).unsqueeze(0)
+
+                # Compute LPIPS
+                lpips_val = lpips_alex(rgb_pred_lpips, rgb_gt_lpips).item()
+                print(f"[LPIPS] Image {img_id}: {lpips_val:.6f}")
+
                 all_mses = ((rgb_gt_test - rgb_pred_test) ** 2).cpu()
                 if i % img_save_interval == 0:
                     img_pred = rgb_pred_test.cpu()
@@ -466,6 +612,8 @@ while True:
                         stats_test[stat_name], global_step=gstep_id_base)
             summary_writer.add_scalar('epoch_id', float(epoch_id), global_step=gstep_id_base)
             print('eval stats:', stats_test)
+            eval_mse_list.append(stats_test['mse'])
+            eval_psnr_list.append(stats_test['psnr'])
     if epoch_id % max(factor, args.eval_every) == 0: #and (epoch_id > 0 or not args.tune_mode):
         # NOTE: we do an eval sanity check, if not in tune_mode
         eval_step()
@@ -552,21 +700,70 @@ while True:
             #          sparsity_file.write(f"{gstep_id} {nz}\n")
 
             # Apply TV/Sparsity regularizers
-            if args.lambda_tv > 0.0:
-                #  with Timing("tv_inpl"):
-                grid.inplace_tv_grad(grid.density_data.grad,
-                        scaling=args.lambda_tv,
-                        sparse_frac=args.tv_sparsity,
+            if args.use_progressive_tv:
+                def progressive_tv(gstep_id, lambda_tv_start, lambda_tv_end, n_iters=args.n_iters):
+                    # Exponential decay: strong at start, weak at end
+                    return lambda_tv_end + (lambda_tv_start - lambda_tv_end) * math.exp(-5.0 * gstep_id / n_iters)
+
+                def progressive_sparsity(gstep_id, sparsity_start, sparsity_end, n_iters=args.n_iters):
+                    return sparsity_end + (sparsity_start - sparsity_end) * math.exp(-5.0 * gstep_id / n_iters)
+
+                # --- Density TV ---
+                if args.lambda_tv > 0.0:
+                    lambda_tv_now = progressive_tv(
+                        gstep_id,
+                        lambda_tv_start=args.progressive_tv_start,
+                        lambda_tv_end=args.progressive_tv_end
+                    )
+                    tv_sparsity_now = progressive_sparsity(
+                        gstep_id,
+                        sparsity_start=args.progressive_sparsity_start,
+                        sparsity_end=args.progressive_sparsity_end
+                    )
+                    grid.inplace_tv_grad(
+                        grid.density_data.grad,
+                        scaling=lambda_tv_now,
+                        sparse_frac=tv_sparsity_now,
                         logalpha=args.tv_logalpha,
                         ndc_coeffs=dset.ndc_coeffs,
-                        contiguous=args.tv_contiguous)
-            if args.lambda_tv_sh > 0.0:
-                #  with Timing("tv_color_inpl"):
-                grid.inplace_tv_color_grad(grid.sh_data.grad,
-                        scaling=args.lambda_tv_sh,
-                        sparse_frac=args.tv_sh_sparsity,
+                        contiguous=args.tv_contiguous
+                    )
+
+                # --- SH TV ---
+                if args.lambda_tv_sh > 0.0:
+                    lambda_tv_sh_now = progressive_tv(
+                        gstep_id,
+                        lambda_tv_start=args.progressive_tv_sh_start,
+                        lambda_tv_end=args.progressive_tv_sh_end
+                    )
+                    tv_sh_sparsity_now = progressive_sparsity(
+                        gstep_id,
+                        sparsity_start=args.tv_sh_sparsity,
+                        sparsity_end=1e-4  # can also make configurable if needed
+                    )
+                    grid.inplace_tv_color_grad(
+                        grid.sh_data.grad,
+                        scaling=lambda_tv_sh_now,
+                        sparse_frac=tv_sh_sparsity_now,
                         ndc_coeffs=dset.ndc_coeffs,
-                        contiguous=args.tv_contiguous)
+                        contiguous=args.tv_contiguous
+                    )
+            else:
+                if args.lambda_tv > 0.0:
+                    #  with Timing("tv_inpl"):
+                    grid.inplace_tv_grad(grid.density_data.grad,
+                            scaling=args.lambda_tv,
+                            sparse_frac=args.tv_sparsity,
+                            logalpha=args.tv_logalpha,
+                            ndc_coeffs=dset.ndc_coeffs,
+                            contiguous=args.tv_contiguous)
+                if args.lambda_tv_sh > 0.0:
+                    #  with Timing("tv_color_inpl"):
+                    grid.inplace_tv_color_grad(grid.sh_data.grad,
+                            scaling=args.lambda_tv_sh,
+                            sparse_frac=args.tv_sh_sparsity,
+                            ndc_coeffs=dset.ndc_coeffs,
+                            contiguous=args.tv_contiguous)
             if args.lambda_tv_lumisphere > 0.0:
                 grid.inplace_tv_lumisphere_grad(grid.sh_data.grad,
                         scaling=args.lambda_tv_lumisphere,
@@ -656,4 +853,8 @@ while True:
         timings_file.write(f"{secs / 60}\n")
         if not args.tune_nosave:
             grid.save(ckpt_path)
+        end_time = time.time()
+        print(f"Total training time: {end_time - start_time:.2f} seconds")
+        print("mse list",eval_mse_list)
+        print("psnr list",eval_psnr_list)
         break
